@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 source /eos/home-a/alantero/t5venv/bin/activate
 
 echo -e "Tu job Condor\nClusterId: ${CLUSTER_ID}\nProcId: ${PROCESS_ID}\nHa comenzado en $(hostname) a las $(date)" \
@@ -10,6 +12,8 @@ python /eos/home-a/alantero/transformational/train_velocity.py \
     --dataset_path "/eos/home-a/alantero/datasets/pretraining_velocity_shards" \
     --output_dir "/eos/home-a/alantero/transformational/results/velocity-base" \
     --manifest_dir "/eos/home-a/alantero/transformational/results/velocity-base/manifests" \
+    --tensorboard always \
+    --tensorboard_dir "/eos/home-a/alantero/transformational/results/velocity-base/tensorboard" \
     --d_model 384 \
     --num_layers 8 \
     --num_heads 8 \
@@ -27,5 +31,9 @@ python /eos/home-a/alantero/transformational/train_velocity.py \
     --eval_every_steps 2000 \
     --save_every_steps 500 \
     --save_total_limit 3 \
-    --progress_bar always \
-    --disable_manifest_cache \
+    --progress_bar never \
+    --disable_manifest_cache
+
+# Para abrir TensorBoard con las rutas de este ejemplo:
+# source /eos/home-a/alantero/t5venv/bin/activate
+# tensorboard --logdir /eos/home-a/alantero/transformational/results/velocity-base/tensorboard --port 6006
