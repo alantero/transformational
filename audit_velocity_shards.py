@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
             "Accepts a CSV with a filepath column, a directory of .mid/.midi files, or a single MIDI file."
         )
     )
-    parser.add_argument("source", type=str, help="CSV, MIDI directory, or single MIDI file")
+    parser.add_argument("source", type=str, nargs="+", help="One or more CSV files, MIDI directories, or single MIDI files")
     parser.add_argument("--max_files", type=int, default=0, help="Optional cap on the number of MIDI files to inspect")
     parser.add_argument("--sample_stride", type=int, default=1, help="Keep one file every N files after sorting")
     parser.add_argument("--offset", type=int, default=0, help="Start file selection from this offset")
@@ -605,9 +605,15 @@ def print_report(report: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    files = iter_midi_files(args.source)
+    seen: set[str] = set()
+    all_files: list[str] = []
+    for src in args.source:
+        for f in iter_midi_files(src):
+            if f not in seen:
+                seen.add(f)
+                all_files.append(f)
     files = select_files(
-        files,
+        sorted(all_files),
         offset=args.offset,
         sample_stride=args.sample_stride,
         max_files=args.max_files,
@@ -615,8 +621,9 @@ def main() -> None:
     if not files:
         raise ValueError("No MIDI files selected for analysis")
 
+    sources_str = ", ".join(args.source)
     print(
-        f"Selected {len(files)} MIDI files from {args.source} "
+        f"Selected {len(files)} MIDI files from [{sources_str}] "
         f"(offset={max(0, args.offset)}, stride={max(1, args.sample_stride)}, max_files={args.max_files or 'all'})"
     )
     report = analyze_files(
@@ -652,7 +659,7 @@ def main() -> None:
         )
 
     file_reports = report.pop("_file_reports")
-    payload = {"source": str(Path(args.source).expanduser().resolve()), "selected_files": len(files), "report": report}
+    payload = {"sources": [str(Path(s).expanduser().resolve()) for s in args.source], "selected_files": len(files), "report": report}
     if args.json_output:
         output_path = Path(args.json_output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
