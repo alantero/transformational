@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--disable_manifest_cache", action="store_true", help="Disable shard manifest caching and always rebuild the shard index like the original t5-midi flow")
+    parser.add_argument("--manifest_dir", type=str, default=None, help="Optional directory where train/val manifest JSON files will be stored")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", help="auto, cuda, cpu, mps, or explicit device string")
     parser.add_argument("--logging_steps", type=int, default=50)
@@ -264,17 +266,33 @@ def main() -> None:
 
     train_dir = Path(args.dataset_path).expanduser().resolve() / "train"
     val_dir = Path(args.dataset_path).expanduser().resolve() / "val"
+    manifest_dir = Path(args.manifest_dir).expanduser().resolve() if args.manifest_dir else None
+    train_manifest_path = str(manifest_dir / "train_manifest.json") if manifest_dir else None
+    val_manifest_path = str(manifest_dir / "val_manifest.json") if manifest_dir else None
+
+    print(f"Preparing train split index from {train_dir}")
     train_dataset = ShardedMIDIVelocityDataset(
         str(train_dir),
         min_notes_per_sequence=args.min_notes_per_sequence,
         default_velocity_bin=args.default_velocity_bin,
+        use_manifest_cache=not args.disable_manifest_cache,
+        manifest_path=train_manifest_path,
+        progress_label="train",
     )
+    print(f"Preparing val split index from {val_dir}")
     val_dataset = ShardedMIDIVelocityDataset(
         str(val_dir),
         min_notes_per_sequence=args.min_notes_per_sequence,
         default_velocity_bin=args.default_velocity_bin,
+        use_manifest_cache=not args.disable_manifest_cache,
+        manifest_path=val_manifest_path,
+        progress_label="val",
     )
     collator = VelocityPredictionCollator()
+    print(
+        f"Indexed datasets: train_shards={len(train_dataset.shard_paths)} train_sequences={len(train_dataset)} "
+        f"val_shards={len(val_dataset.shard_paths)} val_sequences={len(val_dataset)}"
+    )
 
     loader_kwargs = {
         "num_workers": args.num_workers,
@@ -305,6 +323,11 @@ def main() -> None:
     steps_per_epoch = max(1, math.ceil(effective_train_batches / args.gradient_accumulation_steps))
     total_steps = args.max_train_steps if args.max_train_steps > 0 else steps_per_epoch * args.num_train_epochs
     warmup_steps = args.warmup_steps if args.warmup_steps > 0 else int(total_steps * args.warmup_ratio)
+    print(
+        f"Training plan: batches_per_epoch={effective_train_batches} "
+        f"optimizer_steps_per_epoch={steps_per_epoch} total_optimizer_steps={total_steps} "
+        f"warmup_steps={warmup_steps}"
+    )
 
     if args.resume_checkpoint:
         model = VelocityTransformer.from_pretrained(args.resume_checkpoint, map_location="cpu")

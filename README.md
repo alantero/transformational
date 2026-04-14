@@ -54,6 +54,28 @@ python train_velocity.py \
   --save_every_steps 500
 ```
 
+### EOS / Condor note
+
+By default, the trainer now uses a **safe shard manifest cache** to speed up repeated starts on EOS:
+
+- if a valid manifest exists, it is reused
+- if it is missing or stale, the code falls back automatically to the original `t5-midi` behavior and reindexes shards by loading them
+- if the manifest cannot be written, training still continues normally
+
+This means the optimization is conservative: it does **not** replace the original shard-loading flow, it only avoids repeating it when possible.
+
+You can disable this and force the old behavior with:
+
+```bash
+--disable_manifest_cache
+```
+
+If you prefer not to write manifest files into the dataset directory, point them somewhere else:
+
+```bash
+--manifest_dir results/velocity-base/manifests
+```
+
 For a smaller pilot:
 
 ```bash
@@ -79,6 +101,26 @@ python infer_velocity.py \
   --sample_index 0 \
   --output_tokens_path /tmp/predicted_sequence.pt
 ```
+
+## Auditing data quality
+
+To measure how expressive or flat the processed shards already are:
+
+```bash
+python audit_velocity_shards.py /path/to/dataset_root --split both --top_k 10
+```
+
+This reports:
+
+- fraction of flat sequences
+- fraction of sequences with `<= 2` velocity bins
+- per-sequence velocity std and entropy summaries
+- flattest and most expressive shards
+- flattest and most expressive sequences
+
+Important limitation:
+
+- the current shard format does **not** preserve a direct mapping back to the original MIDI file, so this audit is sequence-level and shard-level, not truly per-source-file
 
 From a MIDI file using `../t5-midi` for tokenization/rendering:
 

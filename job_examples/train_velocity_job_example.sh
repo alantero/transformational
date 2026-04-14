@@ -7,6 +7,7 @@ DATASET_PATH="${DATASET_PATH:-/path/to/t5-midi/dataset}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/results/velocity-transformer}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 INIT_MODEL="${INIT_MODEL:-}"
+MANIFEST_DIR="${MANIFEST_DIR:-$OUTPUT_DIR/manifests}"
 
 D_MODEL="${D_MODEL:-384}"
 NUM_LAYERS="${NUM_LAYERS:-8}"
@@ -30,6 +31,7 @@ SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-0}"
 ENABLE_GRADIENT_CHECKPOINTING="${ENABLE_GRADIENT_CHECKPOINTING:-0}"
 ENABLE_COMPILE="${ENABLE_COMPILE:-0}"
+DISABLE_MANIFEST_CACHE="${DISABLE_MANIFEST_CACHE:-0}"
 
 if [[ -n "$VENV_PATH" ]]; then
   # shellcheck source=/dev/null
@@ -46,6 +48,7 @@ cmd=(
   python train_velocity.py
   --dataset_path "$DATASET_PATH"
   --output_dir "$OUTPUT_DIR"
+  --manifest_dir "$MANIFEST_DIR"
   --d_model "$D_MODEL"
   --num_layers "$NUM_LAYERS"
   --num_heads "$NUM_HEADS"
@@ -81,6 +84,10 @@ fi
 
 if [[ "$ENABLE_COMPILE" == "1" ]]; then
   cmd+=(--compile)
+fi
+
+if [[ "$DISABLE_MANIFEST_CACHE" == "1" ]]; then
+  cmd+=(--disable_manifest_cache)
 fi
 
 printf 'Running command:\n'
