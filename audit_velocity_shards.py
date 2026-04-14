@@ -10,7 +10,6 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import mido
 import numpy as np
 import pretty_midi
 
@@ -27,7 +26,7 @@ def parse_args() -> argparse.Namespace:
             "Accepts a CSV with a filepath column, a directory of .mid/.midi files, or a single MIDI file."
         )
     )
-    parser.add_argument("source", type=str, nargs="+", help="One or more CSV files, MIDI directories, or single MIDI files")
+    parser.add_argument("source", type=str, help="CSV, MIDI directory, or single MIDI file")
     parser.add_argument("--max_files", type=int, default=0, help="Optional cap on the number of MIDI files to inspect")
     parser.add_argument("--sample_stride", type=int, default=1, help="Keep one file every N files after sorting")
     parser.add_argument("--offset", type=int, default=0, help="Start file selection from this offset")
@@ -38,9 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low_std_threshold", type=float, default=1.0, help="Threshold for low velocity std in binned units")
     parser.add_argument("--include_drums", action="store_true", help="Include drum tracks; default matches the non-drum pretraining flow")
     parser.add_argument("--json_output", type=str, default=None, help="Optional JSON file with the full report")
-    parser.add_argument("--valid_csv", type=str, default=None, help="Output CSV with filepath column for files that pass velocity filters")
-    parser.add_argument("--min_unique_bins", type=int, default=3, help="Minimum unique velocity bins to include a file in --valid_csv")
-    parser.add_argument("--min_entropy", type=float, default=0.5, help="Minimum binned velocity entropy (bits) to include a file in --valid_csv")
     parser.add_argument("--progress_bar", choices=["auto", "always", "never"], default="auto", help="Show tqdm progress bars")
     return parser.parse_args()
 
@@ -147,14 +143,11 @@ def iter_midi_files(source: str) -> list[str]:
     if not path.is_dir():
         raise ValueError(f"{path} is neither a supported file nor a directory")
 
-    print(f"Scanning {path} for MIDI files...", flush=True)
-    files = []
-    for root, _dirs, filenames in os.walk(path):
-        for name in filenames:
-            if name.lower().endswith((".mid", ".midi")):
-                files.append(os.path.join(root, name))
-    files.sort()
-    print(f"Found {len(files)} MIDI files in {path}", flush=True)
+    files = sorted(
+        str(candidate)
+        for candidate in path.rglob("*")
+        if candidate.is_file() and candidate.suffix.lower() in {".mid", ".midi"}
+    )
     return files
 
 
@@ -166,16 +159,7 @@ def select_files(files: list[str], *, offset: int, sample_stride: int, max_files
 
 
 def process_midi_file(path: str, *, velocity_bins: int, dominant_threshold: float, low_std_threshold: float, include_drums: bool) -> dict:
-    try:
-        pm = pretty_midi.PrettyMIDI(path)
-    except Exception:
-        # Some files have data bytes outside 0-127; clip them and write to a buffer
-        import io
-        midi_obj = mido.MidiFile(path, clip=True)
-        buf = io.BytesIO()
-        midi_obj.save(file=buf)
-        buf.seek(0)
-        pm = pretty_midi.PrettyMIDI(midi_file=buf)
+    pm = pretty_midi.PrettyMIDI(path)
     track_reports = []
     file_velocities: list[int] = []
 
@@ -494,7 +478,6 @@ def analyze_files(
             key=expressive_sort_key,
         )[:top_k],
         "failures": failures[:top_k],
-        "_file_reports": file_reports,
     }
 
 
@@ -608,15 +591,9 @@ def print_report(report: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    seen: set[str] = set()
-    all_files: list[str] = []
-    for src in args.source:
-        for f in iter_midi_files(src):
-            if f not in seen:
-                seen.add(f)
-                all_files.append(f)
+    files = iter_midi_files(args.source)
     files = select_files(
-        sorted(all_files),
+        files,
         offset=args.offset,
         sample_stride=args.sample_stride,
         max_files=args.max_files,
@@ -624,9 +601,8 @@ def main() -> None:
     if not files:
         raise ValueError("No MIDI files selected for analysis")
 
-    sources_str = ", ".join(args.source)
     print(
-        f"Selected {len(files)} MIDI files from [{sources_str}] "
+        f"Selected {len(files)} MIDI files from {args.source} "
         f"(offset={max(0, args.offset)}, stride={max(1, args.sample_stride)}, max_files={args.max_files or 'all'})"
     )
     report = analyze_files(
@@ -641,28 +617,7 @@ def main() -> None:
     )
     print_report(report)
 
-    if args.valid_csv:
-        valid_paths = [
-            r["path"]
-            for r in report["_file_reports"]
-            if r["num_unique_velocity_bins"] >= args.min_unique_bins
-            and r["binned_velocity_entropy_bits"] >= args.min_entropy
-        ]
-        out_csv = Path(args.valid_csv).expanduser().resolve()
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["filepath"])
-            for p in valid_paths:
-                writer.writerow([p])
-        print(
-            f"Saved {len(valid_paths)} valid files to {out_csv} "
-            f"(filtered {len(report['_file_reports']) - len(valid_paths)} files with "
-            f"unique_bins<{args.min_unique_bins} or entropy<{args.min_entropy})"
-        )
-
-    file_reports = report.pop("_file_reports")
-    payload = {"sources": [str(Path(s).expanduser().resolve()) for s in args.source], "selected_files": len(files), "report": report}
+    payload = {"source": str(Path(args.source).expanduser().resolve()), "selected_files": len(files), "report": report}
     if args.json_output:
         output_path = Path(args.json_output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
