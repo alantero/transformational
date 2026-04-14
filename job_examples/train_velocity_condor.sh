@@ -20,11 +20,12 @@ python /eos/home-a/alantero/transformational/train_velocity.py \
     --gradient_accumulation_steps 2 \
     --num_train_epochs 10 \
     --learning_rate 3e-4 \
-    --warmup_steps 2000 \
+    --warmup_steps 1000 \
     --precision fp16 \
     --num_workers 32 \
     --logging_steps 500 \
     --eval_every_steps 2000 \
-    --save_every_steps 2000 \
+    --save_every_steps 500 \
     --save_total_limit 3 \
-    --progress_bar always
+    --progress_bar always \
+    --disable_manifest_cache \
