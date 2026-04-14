@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low_std_threshold", type=float, default=1.0, help="Threshold for low velocity std in binned units")
     parser.add_argument("--include_drums", action="store_true", help="Include drum tracks; default matches the non-drum pretraining flow")
     parser.add_argument("--json_output", type=str, default=None, help="Optional JSON file with the full report")
+    parser.add_argument("--valid_csv", type=str, default=None, help="Output CSV with filepath column for files that pass velocity filters")
+    parser.add_argument("--min_unique_bins", type=int, default=3, help="Minimum unique velocity bins to include a file in --valid_csv")
+    parser.add_argument("--min_entropy", type=float, default=0.5, help="Minimum binned velocity entropy (bits) to include a file in --valid_csv")
     parser.add_argument("--progress_bar", choices=["auto", "always", "never"], default="auto", help="Show tqdm progress bars")
     return parser.parse_args()
 
@@ -163,9 +166,13 @@ def process_midi_file(path: str, *, velocity_bins: int, dominant_threshold: floa
     try:
         pm = pretty_midi.PrettyMIDI(path)
     except Exception:
-        # Some files have data bytes outside 0-127; clip them and retry
+        # Some files have data bytes outside 0-127; clip them and write to a buffer
+        import io
         midi_obj = mido.MidiFile(path, clip=True)
-        pm = pretty_midi.PrettyMIDI(midi_file=midi_obj)
+        buf = io.BytesIO()
+        midi_obj.save(file=buf)
+        buf.seek(0)
+        pm = pretty_midi.PrettyMIDI(midi_file=buf)
     track_reports = []
     file_velocities: list[int] = []
 
@@ -484,6 +491,7 @@ def analyze_files(
             key=expressive_sort_key,
         )[:top_k],
         "failures": failures[:top_k],
+        "_file_reports": file_reports,
     }
 
 
@@ -623,6 +631,27 @@ def main() -> None:
     )
     print_report(report)
 
+    if args.valid_csv:
+        valid_paths = [
+            r["path"]
+            for r in report["_file_reports"]
+            if r["num_unique_velocity_bins"] >= args.min_unique_bins
+            and r["binned_velocity_entropy_bits"] >= args.min_entropy
+        ]
+        out_csv = Path(args.valid_csv).expanduser().resolve()
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filepath"])
+            for p in valid_paths:
+                writer.writerow([p])
+        print(
+            f"Saved {len(valid_paths)} valid files to {out_csv} "
+            f"(filtered {len(report['_file_reports']) - len(valid_paths)} files with "
+            f"unique_bins<{args.min_unique_bins} or entropy<{args.min_entropy})"
+        )
+
+    file_reports = report.pop("_file_reports")
     payload = {"source": str(Path(args.source).expanduser().resolve()), "selected_files": len(files), "report": report}
     if args.json_output:
         output_path = Path(args.json_output).expanduser().resolve()
