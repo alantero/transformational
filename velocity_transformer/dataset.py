@@ -37,6 +37,9 @@ class ShardedMIDIVelocityDataset(Dataset):
         manifest_path: str | None = None,
         progress_label: str | None = None,
         log_every_n_shards: int = 25,
+        shard_offset: int = 0,
+        shard_stride: int = 1,
+        max_shards: int = 0,
     ) -> None:
         self.min_notes_per_sequence = min_notes_per_sequence
         self.default_velocity_bin = default_velocity_bin
@@ -45,17 +48,25 @@ class ShardedMIDIVelocityDataset(Dataset):
         self.progress_label = progress_label or os.path.basename(os.path.abspath(path_or_dir))
         self.log_every_n_shards = max(1, log_every_n_shards)
         self.source_path = os.path.abspath(path_or_dir)
+        self.shard_offset = max(0, shard_offset)
+        self.shard_stride = max(1, shard_stride)
+        self.max_shards = max(0, max_shards)
 
         if os.path.isdir(path_or_dir):
-            self.shard_paths = sorted(
+            shard_paths = sorted(
                 os.path.join(path_or_dir, filename)
                 for filename in os.listdir(path_or_dir)
                 if filename.endswith(".pt") and not filename.startswith(".tmp_")
             )
         elif os.path.isfile(path_or_dir) and path_or_dir.endswith(".pt"):
-            self.shard_paths = [path_or_dir]
+            shard_paths = [path_or_dir]
         else:
             raise ValueError(f"{path_or_dir} is neither a .pt shard nor a directory of shards")
+
+        shard_paths = shard_paths[self.shard_offset :: self.shard_stride]
+        if self.max_shards > 0:
+            shard_paths = shard_paths[: self.max_shards]
+        self.shard_paths = shard_paths
 
         if not self.shard_paths:
             raise ValueError(f"No .pt shards found under {path_or_dir}")
@@ -165,7 +176,8 @@ class ShardedMIDIVelocityDataset(Dataset):
 
     def _build_row_counts_from_shards(self) -> list[int]:
         print(
-            f"[index:{self.progress_label}] indexing {len(self.shard_paths)} shard(s) under {self.source_path}"
+            f"[index:{self.progress_label}] indexing {len(self.shard_paths)} shard(s) under {self.source_path} "
+            f"(offset={self.shard_offset}, stride={self.shard_stride}, max_shards={self.max_shards or 'all'})"
         )
         row_counts: list[int] = []
         total = 0

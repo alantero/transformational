@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--disable_manifest_cache", action="store_true", help="Disable shard manifest caching and always rebuild the shard index like the original t5-midi flow")
     parser.add_argument("--manifest_dir", type=str, default=None, help="Optional directory where train/val manifest JSON files will be stored")
+    parser.add_argument("--train_max_shards", type=int, default=0, help="Use only the first N selected train shards; 0 means all")
+    parser.add_argument("--val_max_shards", type=int, default=0, help="Use only the first N selected val shards; 0 means all")
+    parser.add_argument("--train_shard_offset", type=int, default=0, help="Start train shard selection at this offset")
+    parser.add_argument("--val_shard_offset", type=int, default=0, help="Start val shard selection at this offset")
+    parser.add_argument("--train_shard_stride", type=int, default=1, help="Keep one train shard every N shards")
+    parser.add_argument("--val_shard_stride", type=int, default=1, help="Keep one val shard every N shards")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", help="auto, cuda, cpu, mps, or explicit device string")
     parser.add_argument("--logging_steps", type=int, default=50)
@@ -329,6 +335,9 @@ def main() -> None:
         use_manifest_cache=not args.disable_manifest_cache,
         manifest_path=train_manifest_path,
         progress_label="train",
+        shard_offset=args.train_shard_offset,
+        shard_stride=args.train_shard_stride,
+        max_shards=args.train_max_shards,
     )
     print(f"Preparing val split index from {val_dir}")
     val_dataset = ShardedMIDIVelocityDataset(
@@ -338,6 +347,9 @@ def main() -> None:
         use_manifest_cache=not args.disable_manifest_cache,
         manifest_path=val_manifest_path,
         progress_label="val",
+        shard_offset=args.val_shard_offset,
+        shard_stride=args.val_shard_stride,
+        max_shards=args.val_max_shards,
     )
     collator = VelocityPredictionCollator()
     print(

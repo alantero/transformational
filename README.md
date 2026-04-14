@@ -112,23 +112,29 @@ python infer_velocity.py \
 
 ## Auditing data quality
 
-To measure how expressive or flat the processed shards already are:
+To measure how expressive or flat the original MIDI corpus is, audit the `.mid` files directly:
+
+From a CSV with a `filepath` column:
 
 ```bash
-python audit_velocity_shards.py /path/to/dataset_root --split both --top_k 10
+python audit_velocity_shards.py /path/to/valid_full_files.csv --max_files 2000 --workers 8 --top_k 20
+```
+
+From a MIDI directory:
+
+```bash
+python audit_velocity_shards.py /path/to/midi_root --max_files 2000 --workers 8 --top_k 20
 ```
 
 This reports:
 
-- fraction of flat sequences
-- fraction of sequences with `<= 2` velocity bins
-- per-sequence velocity std and entropy summaries
-- flattest and most expressive shards
-- flattest and most expressive sequences
+- flat / low-diversity ratios by file
+- flat / low-diversity ratios by track
+- velocity-bin diversity summaries aligned with the model's `32` bins
+- flattest and most expressive files
+- flattest and most expressive tracks
 
-Important limitation:
-
-- the current shard format does **not** preserve a direct mapping back to the original MIDI file, so this audit is sequence-level and shard-level, not truly per-source-file
+This is usually the right audit for deciding whether the source corpus contains enough expressive velocity variation before training.
 
 From a MIDI file using `../t5-midi` for tokenization/rendering:
 
