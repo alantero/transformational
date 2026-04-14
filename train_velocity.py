@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -14,6 +15,11 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 from velocity_transformer.data_utils import IGNORE_INDEX
 from velocity_transformer.dataset import ShardedMIDIVelocityDataset, VelocityPredictionCollator
@@ -80,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stopping_patience", type=int, default=0, help="Number of eval calls without improvement before stopping; 0 disables")
     parser.add_argument("--limit_train_batches", type=int, default=0, help="For debugging or smoke tests")
     parser.add_argument("--limit_val_batches", type=int, default=0, help="For debugging or smoke tests")
+    parser.add_argument("--progress_bar", choices=["auto", "always", "never"], default="auto", help="Show tqdm progress bars in interactive terminals; auto keeps Condor logs cleaner")
 
     parser.add_argument("--min_notes_per_sequence", type=int, default=1)
     parser.add_argument("--default_velocity_bin", type=int, default=None)
@@ -92,6 +99,20 @@ def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def should_enable_progress_bar(mode: str) -> bool:
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return sys.stderr.isatty()
+
+
+def create_progress_bar(*, enabled: bool, total: int, desc: str, leave: bool):
+    if not enabled or tqdm is None:
+        return None
+    return tqdm(total=total, desc=desc, leave=leave, dynamic_ncols=True)
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -151,6 +172,9 @@ def evaluate(
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     limit_batches: int = 0,
+    progress_bar_enabled: bool = False,
+    progress_desc: str = "eval",
+    progress_leave: bool = False,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -158,6 +182,16 @@ def evaluate(
     total_abs_error = 0.0
     total_within_1 = 0
     total_notes = 0
+    processed_batches = 0
+    eval_total_batches = len(dataloader)
+    if limit_batches:
+        eval_total_batches = min(eval_total_batches, limit_batches)
+    eval_bar = create_progress_bar(
+        enabled=progress_bar_enabled,
+        total=eval_total_batches,
+        desc=progress_desc,
+        leave=progress_leave,
+    )
 
     for batch_idx, batch in enumerate(dataloader):
         if limit_batches and batch_idx >= limit_batches:
@@ -185,6 +219,19 @@ def evaluate(
         total_abs_error += float(abs_error.sum().item())
         total_within_1 += int(abs_error.le(1).sum().item())
         total_notes += valid_count
+        processed_batches += 1
+        if eval_bar is not None:
+            eval_bar.update(1)
+            eval_bar.set_postfix(
+                loss=f"{total_loss / max(1, total_notes):.4f}",
+                acc=f"{total_correct / max(1, total_notes):.4f}",
+                mae=f"{total_abs_error / max(1, total_notes):.3f}",
+            )
+
+    if eval_bar is not None:
+        if processed_batches == 0:
+            eval_bar.set_postfix(loss="n/a", acc="n/a", mae="n/a")
+        eval_bar.close()
 
     model.train()
     if total_notes == 0:
@@ -263,6 +310,10 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(f"Autocast dtype: {autocast_dtype}")
+    progress_bar_enabled = should_enable_progress_bar(args.progress_bar)
+    if args.progress_bar != "never" and tqdm is None:
+        print("Progress bars requested but tqdm is not installed; falling back to plain logs")
+        progress_bar_enabled = False
 
     train_dir = Path(args.dataset_path).expanduser().resolve() / "train"
     val_dir = Path(args.dataset_path).expanduser().resolve() / "val"
@@ -395,6 +446,9 @@ def main() -> None:
             device=device,
             autocast_dtype=autocast_dtype,
             limit_batches=args.limit_val_batches,
+            progress_bar_enabled=progress_bar_enabled,
+            progress_desc=f"eval step {step}",
+            progress_leave=False,
         )
         event = {
             "type": "eval",
@@ -437,11 +491,19 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     training_start = time.time()
     stop_training = False
+    last_eval_metrics: dict[str, float] | None = None
 
     for epoch in range(start_epoch, args.num_train_epochs):
         run_model.train()
         micro_loss_accumulator = 0.0
         optimizer.zero_grad(set_to_none=True)
+        epoch_updates_total = min(steps_per_epoch, max(0, total_steps - global_step))
+        train_bar = create_progress_bar(
+            enabled=progress_bar_enabled,
+            total=epoch_updates_total,
+            desc=f"train epoch {epoch + 1}/{args.num_train_epochs}",
+            leave=False,
+        )
 
         for batch_idx, batch in enumerate(train_loader):
             if args.limit_train_batches and batch_idx >= args.limit_train_batches:
@@ -480,9 +542,21 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            batch_metrics = compute_metrics(outputs["logits"].detach(), batch["labels"])
+
+            if train_bar is not None:
+                postfix = {
+                    "loss": f"{micro_loss_accumulator:.4f}",
+                    "acc": f"{batch_metrics['accuracy']:.4f}",
+                    "mae": f"{batch_metrics['mae_bins']:.3f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+                }
+                if last_eval_metrics is not None:
+                    postfix["eval"] = f"{last_eval_metrics['eval_loss']:.4f}"
+                train_bar.update(1)
+                train_bar.set_postfix(postfix)
 
             if global_step % args.logging_steps == 0 or global_step == 1:
-                batch_metrics = compute_metrics(outputs["logits"].detach(), batch["labels"])
                 elapsed = time.time() - training_start
                 event = {
                     "type": "train",
@@ -496,18 +570,30 @@ def main() -> None:
                     "elapsed_seconds": elapsed,
                 }
                 append_metrics(event)
-                print(
-                    "[train]",
-                    f"step={global_step}/{total_steps}",
-                    f"loss={micro_loss_accumulator:.4f}",
-                    f"acc={batch_metrics['accuracy']:.4f}",
-                    f"mae={batch_metrics['mae_bins']:.4f}",
-                    f"lr={scheduler.get_last_lr()[0]:.6f}",
-                )
+                if train_bar is None:
+                    print(
+                        "[train]",
+                        f"step={global_step}/{total_steps}",
+                        f"loss={micro_loss_accumulator:.4f}",
+                        f"acc={batch_metrics['accuracy']:.4f}",
+                        f"mae={batch_metrics['mae_bins']:.4f}",
+                        f"lr={scheduler.get_last_lr()[0]:.6f}",
+                    )
                 micro_loss_accumulator = 0.0
 
             if args.eval_every_steps and global_step % args.eval_every_steps == 0:
+                if train_bar is not None:
+                    train_bar.refresh()
                 metrics = run_evaluation(epoch, global_step, reason="steps")
+                last_eval_metrics = metrics
+                if train_bar is not None:
+                    train_bar.set_postfix(
+                        loss=f"{micro_loss_accumulator:.4f}",
+                        acc=f"{batch_metrics['accuracy']:.4f}",
+                        mae=f"{batch_metrics['mae_bins']:.3f}",
+                        lr=f"{scheduler.get_last_lr()[0]:.6f}",
+                        eval=f"{metrics['eval_loss']:.4f}",
+                    )
                 if metrics["eval_loss"] < best_eval_loss:
                     best_eval_loss = metrics["eval_loss"]
                     evals_without_improvement = 0
@@ -537,7 +623,10 @@ def main() -> None:
                 stop_training = True
                 break
 
+        if train_bar is not None:
+            train_bar.refresh()
         metrics = run_evaluation(epoch, global_step, reason="epoch_end")
+        last_eval_metrics = metrics
         if metrics["eval_loss"] < best_eval_loss:
             best_eval_loss = metrics["eval_loss"]
             evals_without_improvement = 0
@@ -563,6 +652,12 @@ def main() -> None:
 
         if stop_training:
             break
+
+        if train_bar is not None:
+            train_bar.close()
+
+    if 'train_bar' in locals() and train_bar is not None:
+        train_bar.close()
 
     final_metadata = {
         "global_step": global_step,

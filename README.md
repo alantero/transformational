@@ -76,6 +76,14 @@ If you prefer not to write manifest files into the dataset directory, point them
 --manifest_dir results/velocity-base/manifests
 ```
 
+Progress bars are also available:
+
+- `--progress_bar auto`: default, only show tqdm bars in interactive terminals
+- `--progress_bar always`: force bars in an interactive EOS shell
+- `--progress_bar never`: cleaner plain logs for Condor batch jobs
+
+The progress bars show current training loss/acc/mae/lr and the latest validation loss when evaluation runs.
+
 For a smaller pilot:
 
 ```bash
