@@ -15,6 +15,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - optional dependency
+    SummaryWriter = None
 
 try:
     from tqdm.auto import tqdm
@@ -93,6 +97,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit_train_batches", type=int, default=0, help="For debugging or smoke tests")
     parser.add_argument("--limit_val_batches", type=int, default=0, help="For debugging or smoke tests")
     parser.add_argument("--progress_bar", choices=["auto", "always", "never"], default="auto", help="Show tqdm progress bars in interactive terminals; auto keeps Condor logs cleaner")
+    parser.add_argument("--tensorboard", choices=["auto", "always", "never"], default="auto", help="Write TensorBoard event files under output_dir; auto enables it when tensorboard is installed")
+    parser.add_argument("--tensorboard_dir", type=str, default=None, help="Optional TensorBoard log directory; defaults to <output_dir>/tensorboard")
+    parser.add_argument("--tensorboard_flush_secs", type=int, default=30, help="Flush TensorBoard event files every N seconds")
 
     parser.add_argument("--min_notes_per_sequence", type=int, default=1)
     parser.add_argument("--default_velocity_bin", type=int, default=None)
@@ -119,6 +126,26 @@ def create_progress_bar(*, enabled: bool, total: int, desc: str, leave: bool):
     if not enabled or tqdm is None:
         return None
     return tqdm(total=total, desc=desc, leave=leave, dynamic_ncols=True)
+
+
+def log_event_to_tensorboard(writer: SummaryWriter, event: dict) -> None:
+    step = int(event.get("global_step", 0))
+    event_type = event.get("type")
+    if event_type == "train":
+        writer.add_scalar("train/loss", float(event.get("train_loss_avg", event["train_loss"])), step)
+        writer.add_scalar("train/loss_sum", float(event["train_loss"]), step)
+        writer.add_scalar("train/batch_accuracy", float(event["train_batch_accuracy"]), step)
+        writer.add_scalar("train/batch_mae_bins", float(event["train_batch_mae_bins"]), step)
+        writer.add_scalar("train/batch_within_1_bin", float(event["train_batch_within_1_bin"]), step)
+        writer.add_scalar("train/learning_rate", float(event["learning_rate"]), step)
+        writer.add_scalar("train/elapsed_seconds", float(event["elapsed_seconds"]), step)
+        writer.add_scalar("train/logged_updates", float(event.get("logged_updates", 1)), step)
+    elif event_type == "eval":
+        writer.add_scalar("eval/loss", float(event["eval_loss"]), step)
+        writer.add_scalar("eval/accuracy", float(event["eval_accuracy"]), step)
+        writer.add_scalar("eval/mae_bins", float(event["eval_mae_bins"]), step)
+        writer.add_scalar("eval/within_1_bin", float(event["eval_within_1_bin"]), step)
+        writer.add_scalar("eval/supervised_notes", float(event["eval_supervised_notes"]), step)
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
@@ -156,7 +183,8 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, flo
             "supervised_notes": 0.0,
         }
 
-    valid_logits = logits[valid_mask]
+    # Compute metrics in fp32 to avoid numerical issues when the model runs in fp16.
+    valid_logits = logits[valid_mask].float()
     valid_labels = labels[valid_mask]
     loss = F.cross_entropy(valid_logits, valid_labels, reduction="mean").item()
     predictions = valid_logits.argmax(dim=-1)
@@ -214,7 +242,8 @@ def evaluate(
         if valid_count == 0:
             continue
 
-        valid_logits = logits[valid_mask]
+        # Keep the summed eval loss in fp32; large validation batches can overflow in fp16.
+        valid_logits = logits[valid_mask].float()
         valid_labels = labels[valid_mask]
         loss_sum = F.cross_entropy(valid_logits, valid_labels, reduction="sum").item()
         predictions = valid_logits.argmax(dim=-1)
@@ -321,6 +350,24 @@ def main() -> None:
         print("Progress bars requested but tqdm is not installed; falling back to plain logs")
         progress_bar_enabled = False
 
+    tensorboard_writer: SummaryWriter | None = None
+    tensorboard_dir = Path(args.tensorboard_dir).expanduser().resolve() if args.tensorboard_dir else output_dir / "tensorboard"
+    if args.tensorboard != "never":
+        if SummaryWriter is None:
+            message = "TensorBoard logging requested but tensorboard is not installed"
+            if args.tensorboard == "always":
+                raise RuntimeError(f"{message}. Install it with `pip install tensorboard` or use --tensorboard never.")
+            print(f"{message}; continuing without TensorBoard logs")
+        else:
+            tensorboard_dir.mkdir(parents=True, exist_ok=True)
+            tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_dir), flush_secs=args.tensorboard_flush_secs)
+            print(f"TensorBoard logs: {tensorboard_dir}")
+            tensorboard_writer.add_text(
+                "run/config",
+                f"```json\n{json.dumps(vars(args), indent=2, sort_keys=True)}\n```",
+                global_step=0,
+            )
+
     train_dir = Path(args.dataset_path).expanduser().resolve() / "train"
     val_dir = Path(args.dataset_path).expanduser().resolve() / "val"
     manifest_dir = Path(args.manifest_dir).expanduser().resolve() if args.manifest_dir else None
@@ -356,6 +403,11 @@ def main() -> None:
         f"Indexed datasets: train_shards={len(train_dataset.shard_paths)} train_sequences={len(train_dataset)} "
         f"val_shards={len(val_dataset.shard_paths)} val_sequences={len(val_dataset)}"
     )
+    if tensorboard_writer is not None:
+        tensorboard_writer.add_scalar("dataset/train_shards", float(len(train_dataset.shard_paths)), 0)
+        tensorboard_writer.add_scalar("dataset/train_sequences", float(len(train_dataset)), 0)
+        tensorboard_writer.add_scalar("dataset/val_shards", float(len(val_dataset.shard_paths)), 0)
+        tensorboard_writer.add_scalar("dataset/val_sequences", float(len(val_dataset)), 0)
 
     loader_kwargs = {
         "num_workers": args.num_workers,
@@ -401,6 +453,11 @@ def main() -> None:
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
+
+    num_parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Model parameters: {num_parameters:,}")
+    if tensorboard_writer is not None:
+        tensorboard_writer.add_scalar("model/parameters", float(num_parameters), 0)
 
     model.to(device)
     run_model: torch.nn.Module = model
@@ -450,6 +507,8 @@ def main() -> None:
     def append_metrics(event: dict) -> None:
         with open(metrics_log_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
+        if tensorboard_writer is not None:
+            log_event_to_tensorboard(tensorboard_writer, event)
 
     def run_evaluation(epoch: int, step: int, reason: str) -> dict[str, float]:
         metrics = evaluate(
@@ -470,6 +529,8 @@ def main() -> None:
             **metrics,
         }
         append_metrics(event)
+        if tensorboard_writer is not None:
+            tensorboard_writer.flush()
         print(
             "[eval]",
             f"step={step}",
@@ -508,6 +569,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.num_train_epochs):
         run_model.train()
         micro_loss_accumulator = 0.0
+        logged_updates = 0
         optimizer.zero_grad(set_to_none=True)
         epoch_updates_total = min(steps_per_epoch, max(0, total_steps - global_step))
         train_bar = create_progress_bar(
@@ -554,6 +616,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            logged_updates += 1
             batch_metrics = compute_metrics(outputs["logits"].detach(), batch["labels"])
 
             if train_bar is not None:
@@ -570,11 +633,14 @@ def main() -> None:
 
             if global_step % args.logging_steps == 0 or global_step == 1:
                 elapsed = time.time() - training_start
+                train_loss_avg = micro_loss_accumulator / max(1, logged_updates)
                 event = {
                     "type": "train",
                     "epoch": epoch,
                     "global_step": global_step,
                     "train_loss": micro_loss_accumulator,
+                    "train_loss_avg": train_loss_avg,
+                    "logged_updates": logged_updates,
                     "train_batch_accuracy": batch_metrics["accuracy"],
                     "train_batch_mae_bins": batch_metrics["mae_bins"],
                     "train_batch_within_1_bin": batch_metrics["within_1_bin"],
@@ -586,12 +652,13 @@ def main() -> None:
                     print(
                         "[train]",
                         f"step={global_step}/{total_steps}",
-                        f"loss={micro_loss_accumulator:.4f}",
+                        f"loss={train_loss_avg:.4f}",
                         f"acc={batch_metrics['accuracy']:.4f}",
                         f"mae={batch_metrics['mae_bins']:.4f}",
                         f"lr={scheduler.get_last_lr()[0]:.6f}",
                     )
                 micro_loss_accumulator = 0.0
+                logged_updates = 0
 
             if args.eval_every_steps and global_step % args.eval_every_steps == 0:
                 if train_bar is not None:
@@ -677,6 +744,11 @@ def main() -> None:
         "training_seconds": time.time() - training_start,
     }
     maybe_save_named_snapshot(output_dir, "final_model", model=run_model, metadata=final_metadata)
+    if tensorboard_writer is not None:
+        tensorboard_writer.add_scalar("run/best_eval_loss", float(best_eval_loss), global_step)
+        tensorboard_writer.add_scalar("run/training_seconds", float(final_metadata["training_seconds"]), global_step)
+        tensorboard_writer.flush()
+        tensorboard_writer.close()
     print(f"Training finished. Best eval loss: {best_eval_loss:.4f}")
 
 

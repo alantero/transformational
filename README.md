@@ -54,6 +54,23 @@ python train_velocity.py \
   --save_every_steps 500
 ```
 
+TensorBoard is now written automatically when the `tensorboard` package is installed. Event files go to `results/velocity-base/tensorboard` by default.
+
+To force it explicitly:
+
+```bash
+python train_velocity.py \
+  --dataset_path /path/to/dataset_root \
+  --output_dir results/velocity-base \
+  --tensorboard always
+```
+
+To open the logs locally:
+
+```bash
+tensorboard --logdir results/velocity-base/tensorboard
+```
+
 ### EOS / Condor note
 
 By default, the trainer now uses a **safe shard manifest cache** to speed up repeated starts on EOS:
@@ -83,6 +100,21 @@ Progress bars are also available:
 - `--progress_bar never`: cleaner plain logs for Condor batch jobs
 
 The progress bars show current training loss/acc/mae/lr and the latest validation loss when evaluation runs.
+
+TensorBoard writes:
+
+- `train/loss`
+- `train/batch_accuracy`
+- `train/batch_mae_bins`
+- `train/batch_within_1_bin`
+- `train/learning_rate`
+- `eval/loss`
+- `eval/accuracy`
+- `eval/mae_bins`
+- `eval/within_1_bin`
+- dataset and model metadata at step `0`
+
+For batch jobs, TensorBoard is usually a better long-run monitoring mechanism than terminal progress bars.
 
 For a smaller pilot:
 
@@ -164,6 +196,7 @@ Training writes:
 
 - `run_config.json`
 - `metrics.jsonl`
+- `tensorboard/` event files
 - rolling `checkpoint-*` directories with optimizer state
 - `best_model/`
 - `final_model/`
