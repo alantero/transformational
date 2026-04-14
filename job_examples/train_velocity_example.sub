@@ -1,0 +1,10 @@
+universe = vanilla
+executable = job_examples/train_velocity_job_example.sh
+should_transfer_files = YES
+transfer_input_files = train_velocity.py, infer_velocity.py, job_examples/train_velocity_job_example.sh, velocity_transformer
+getenv = true
++WantGPU = TRUE
+request_cpus = 8
+request_memory = 32GB
+request_gpus = 1
+queue

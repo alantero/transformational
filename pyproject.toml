@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "velocity-transformer"
+version = "0.1.0"
+description = "Lightweight transformer encoder for MIDI velocity prediction over t5-midi token shards."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.1",
+]
+
+[tool.setuptools]
+packages = ["velocity_transformer"]
