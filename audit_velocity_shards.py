@@ -147,11 +147,14 @@ def iter_midi_files(source: str) -> list[str]:
     if not path.is_dir():
         raise ValueError(f"{path} is neither a supported file nor a directory")
 
-    files = sorted(
-        str(candidate)
-        for candidate in path.rglob("*")
-        if candidate.is_file() and candidate.suffix.lower() in {".mid", ".midi"}
-    )
+    print(f"Scanning {path} for MIDI files...", flush=True)
+    files = []
+    for root, _dirs, filenames in os.walk(path):
+        for name in filenames:
+            if name.lower().endswith((".mid", ".midi")):
+                files.append(os.path.join(root, name))
+    files.sort()
+    print(f"Found {len(files)} MIDI files in {path}", flush=True)
     return files
 
 
