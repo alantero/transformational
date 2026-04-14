@@ -10,6 +10,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import mido
 import numpy as np
 import pretty_midi
 
@@ -159,7 +160,12 @@ def select_files(files: list[str], *, offset: int, sample_stride: int, max_files
 
 
 def process_midi_file(path: str, *, velocity_bins: int, dominant_threshold: float, low_std_threshold: float, include_drums: bool) -> dict:
-    pm = pretty_midi.PrettyMIDI(path)
+    try:
+        pm = pretty_midi.PrettyMIDI(path)
+    except Exception:
+        # Some files have data bytes outside 0-127; clip them and retry
+        midi_obj = mido.MidiFile(path, clip=True)
+        pm = pretty_midi.PrettyMIDI(midi_file=midi_obj)
     track_reports = []
     file_velocities: list[int] = []
 
