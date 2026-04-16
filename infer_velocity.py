@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -49,7 +50,12 @@ from velocity_transformer.data_utils import (
     compact_sequence_for_velocity_prediction,
     reconstruct_sequence_with_predicted_velocities,
 )
-from velocity_transformer.midi_bridge import midi_file_to_token_ids, token_ids_to_pretty_midi
+from velocity_transformer.midi_bridge import (
+    MIDITokenizationResult,
+    apply_velocity_bins_to_midi,
+    token_ids_to_pretty_midi,
+    tokenize_midi_file_for_velocity,
+)
 from velocity_transformer.model import VelocityTransformer
 from velocity_transformer.training_utils import autocast_context, detect_device, resolve_autocast_dtype
 
@@ -87,6 +93,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample_index", type=int, default=0,
         help="Row index when reading from a shard or 2-D tensor.",
+    )
+    parser.add_argument(
+        "--merge_tracks", action="store_true",
+        help="Merge all non-drum tracks into one before tokenisation. "
+             "Use when the input MIDI has multiple tracks for the same instrument. "
+             "When writing MIDI output, this also saves a single merged track.",
     )
 
     # --- sliding window ---
@@ -130,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile",   action="store_true", help="torch.compile the model.")
     parser.add_argument(
         "--t5_midi_repo", type=str, default=None,
-        help="Path to the t5-midi repo root. Required for --midi_path and --output_midi_path.",
+        help="Optional path to the t5-midi repo root. Kept for compatibility with older workflows.",
     )
 
     # --- output ---
@@ -145,29 +157,50 @@ def parse_args() -> argparse.Namespace:
 # Input loading
 # ---------------------------------------------------------------------------
 
-def load_input_sequence(args: argparse.Namespace) -> list[int]:
+
+@dataclass
+class LoadedInputSequence:
+    token_ids: list[int]
+    tempo_bpm: int
+    midi_context: MIDITokenizationResult | None = None
+
+
+def load_input_sequence(args: argparse.Namespace) -> LoadedInputSequence:
+    """Return token ids plus optional MIDI context for exact write-back."""
     if args.input_shard:
         t = torch.load(args.input_shard, map_location="cpu")
         if t.dim() != 2:
             raise ValueError("--input_shard must point to a 2-D tensor shard")
-        return t[args.sample_index].tolist()
+        return LoadedInputSequence(token_ids=t[args.sample_index].tolist(), tempo_bpm=120)
     if args.input_tensor:
         t = torch.load(args.input_tensor, map_location="cpu")
         if t.dim() == 2:
             t = t[args.sample_index]
         if t.dim() != 1:
             raise ValueError("--input_tensor must be 1-D or 2-D with --sample_index")
-        return t.tolist()
+        return LoadedInputSequence(token_ids=t.tolist(), tempo_bpm=120)
     if args.input_json:
         with open(args.input_json, "r", encoding="utf-8") as fh:
-            return list(json.load(fh))
+            return LoadedInputSequence(token_ids=list(json.load(fh)), tempo_bpm=120)
     if args.input_text:
         raw = Path(args.input_text).read_text(encoding="utf-8").strip()
-        return [int(x) for x in raw.split()] if raw else []
+        return LoadedInputSequence(token_ids=([int(x) for x in raw.split()] if raw else []), tempo_bpm=120)
     if args.input_ids:
-        return [int(x.strip()) for x in args.input_ids.split(",") if x.strip()]
+        return LoadedInputSequence(
+            token_ids=[int(x.strip()) for x in args.input_ids.split(",") if x.strip()],
+            tempo_bpm=120,
+        )
     if args.midi_path:
-        return midi_file_to_token_ids(args.midi_path, repo_path=args.t5_midi_repo)
+        midi_context = tokenize_midi_file_for_velocity(
+            args.midi_path,
+            repo_path=args.t5_midi_repo,
+            merge_tracks=args.merge_tracks,
+        )
+        return LoadedInputSequence(
+            token_ids=midi_context.token_ids,
+            tempo_bpm=midi_context.tempo_bpm,
+            midi_context=midi_context,
+        )
     raise RuntimeError("No input source provided")
 
 
@@ -259,8 +292,15 @@ def _run_single_model_windows(
             actual_len = e - s
 
             # --- center mask ---
-            # margin shrinks for short windows (sequence tail)
-            margin = min(half_margin, actual_len // 3)
+            # If this window covers the full available sequence there are no
+            # truncated-context boundary artifacts on either side, so trust
+            # every position.  Only apply center masking when the window is
+            # a strict sub-range of a longer sequence, where tokens beyond the
+            # window boundary are genuinely missing from the context.
+            if actual_len >= seq_len:
+                margin = 0
+            else:
+                margin = min(half_margin, actual_len // 3)
             center_start = margin
             center_end   = actual_len - margin
 
@@ -430,7 +470,10 @@ def main() -> None:
     print(f"Center fraction: {args.center_fraction}  TTA passes: {args.tta_passes}")
 
     # --- tokenise input ---
-    original_sequence = load_input_sequence(args)
+    loaded_input = load_input_sequence(args)
+    original_sequence = loaded_input.token_ids
+    tempo_bpm = loaded_input.tempo_bpm
+    print(f"Tempo         : {tempo_bpm} BPM")
     compact_tokens, labels, note_on_positions = compact_sequence_for_velocity_prediction(
         original_sequence
     )
@@ -471,7 +514,23 @@ def main() -> None:
         with open(args.output_json_path, "w", encoding="utf-8") as fh:
             json.dump(predicted_sequence, fh)
     if args.output_midi_path:
-        midi = token_ids_to_pretty_midi(predicted_sequence, repo_path=args.t5_midi_repo)
+        if loaded_input.midi_context is not None:
+            predicted_note_bins = predicted_bins[torch.tensor(note_on_positions, dtype=torch.long)].tolist()
+            midi = apply_velocity_bins_to_midi(
+                loaded_input.midi_context,
+                predicted_note_bins,
+                merge_selected_tracks=args.merge_tracks,
+            )
+            if args.merge_tracks:
+                print("MIDI output    : writing predicted velocities to a merged single-track MIDI while preserving timing and tempo")
+            else:
+                print("MIDI output    : writing predicted velocities back onto the original MIDI to preserve timing and tempo")
+        else:
+            midi = token_ids_to_pretty_midi(
+                predicted_sequence,
+                repo_path=args.t5_midi_repo,
+                tempo=tempo_bpm,
+            )
         midi.write(args.output_midi_path)
 
     # --- metrics (only when the input already has velocity info) ---
@@ -486,6 +545,20 @@ def main() -> None:
             f"  mae (bins) = {abs_error.float().mean():.4f}\n"
             f"  within ±1  = {abs_error.le(1).float().mean():.4f}"
         )
+
+        # --- bin distribution diagnostics ---
+        from collections import Counter
+        pred_ctr  = Counter(pred_bins.tolist())
+        true_ctr  = Counter(target_bins.tolist())
+        n_notes   = int(valid_labels.sum())
+        print(f"\nPredicted bin distribution (out of {n_notes} notes):")
+        for b, cnt in sorted(pred_ctr.items()):
+            bar = "#" * int(cnt / n_notes * 60)
+            print(f"  bin {b:2d} ({b*4:3d}-{b*4+3:3d} vel): {cnt:5d}  {bar}")
+        print(f"\nTrue bin distribution:")
+        for b, cnt in sorted(true_ctr.items()):
+            bar = "#" * int(cnt / n_notes * 60)
+            print(f"  bin {b:2d} ({b*4:3d}-{b*4+3:3d} vel): {cnt:5d}  {bar}")
 
     print(
         f"\nInference complete: original_tokens={len(original_sequence)} "

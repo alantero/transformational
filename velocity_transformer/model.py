@@ -30,13 +30,18 @@ class VelocityTransformerConfig:
     num_relative_attention_buckets: int = 32
     relative_attention_max_distance: int = 1024
     label_smoothing: float = 0.0
+    ordinal_loss_weight: float = 0.0
 
     def to_dict(self) -> dict[str, int | float]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, int | float]) -> "VelocityTransformerConfig":
-        return cls(**data)
+        # Filter to known fields so old checkpoints (without new fields) and
+        # future checkpoints (with unknown fields) both load cleanly.
+        import dataclasses as _dc
+        known = {f.name for f in _dc.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class RMSNorm(nn.Module):
@@ -231,12 +236,38 @@ class VelocityTransformer(nn.Module):
         if labels is not None:
             valid_positions = labels.ne(IGNORE_INDEX)
             if valid_positions.any():
-                loss = F.cross_entropy(
-                    logits.view(-1, self.config.num_velocity_bins),
-                    labels.view(-1),
-                    ignore_index=IGNORE_INDEX,
+                valid_logits = logits[valid_positions].float()
+                valid_labels = labels[valid_positions]
+
+                ce_loss = F.cross_entropy(
+                    valid_logits,
+                    valid_labels,
                     label_smoothing=self.config.label_smoothing,
                 )
+
+                if self.config.ordinal_loss_weight > 0.0:
+                    # Expected-value regression: the 32 velocity bins are ordinal
+                    # (bin 20 is closer to bin 21 than to bin 0).  CE treats them
+                    # as unordered categories, so predicting bin 20 when truth is
+                    # 21 gets the same penalty as predicting bin 0.  The ordinal
+                    # term E[bin] = Σ(i · softmax(logit_i)) and an L1 penalty
+                    # against the true bin pushes the model toward "close" when
+                    # it can't be exact.
+                    probs = F.softmax(valid_logits, dim=-1)
+                    bin_indices = torch.arange(
+                        self.config.num_velocity_bins,
+                        device=valid_logits.device,
+                        dtype=torch.float32,
+                    )
+                    expected_bins = (probs * bin_indices).sum(dim=-1)
+                    ordinal_loss = F.smooth_l1_loss(
+                        expected_bins, valid_labels.float()
+                    )
+                    loss = ce_loss + self.config.ordinal_loss_weight * ordinal_loss
+                    output["ce_loss"] = ce_loss
+                    output["ordinal_loss"] = ordinal_loss
+                else:
+                    loss = ce_loss
             else:
                 loss = logits.sum() * 0.0
             output["loss"] = loss

@@ -31,6 +31,7 @@ class ShardedMIDIVelocityDataset(Dataset):
         path_or_dir: str,
         *,
         min_notes_per_sequence: int = 1,
+        min_unique_velocity_bins: int = 0,
         default_velocity_bin: int | None = None,
         max_retry_samples: int = 8,
         use_manifest_cache: bool = True,
@@ -42,6 +43,7 @@ class ShardedMIDIVelocityDataset(Dataset):
         max_shards: int = 0,
     ) -> None:
         self.min_notes_per_sequence = min_notes_per_sequence
+        self.min_unique_velocity_bins = min_unique_velocity_bins
         self.default_velocity_bin = default_velocity_bin
         self.max_retry_samples = max_retry_samples
         self.use_manifest_cache = use_manifest_cache
@@ -242,9 +244,12 @@ class ShardedMIDIVelocityDataset(Dataset):
         compact_tokens, labels, note_on_positions = compact_sequence_for_velocity_prediction(
             sequence, default_velocity_bin=self.default_velocity_bin
         )
-        supervised_notes = sum(label != IGNORE_INDEX for label in labels)
-        if supervised_notes < self.min_notes_per_sequence or not compact_tokens:
+        supervised_labels = [label for label in labels if label != IGNORE_INDEX]
+        if len(supervised_labels) < self.min_notes_per_sequence or not compact_tokens:
             return None
+        if self.min_unique_velocity_bins > 0:
+            if len(set(supervised_labels)) < self.min_unique_velocity_bins:
+                return None
 
         input_ids = torch.tensor(compact_tokens, dtype=torch.long)
         label_tensor = torch.tensor(labels, dtype=torch.long)

@@ -179,6 +179,11 @@ python infer_velocity.py \
   --output_midi_path /tmp/predicted_sequence.mid
 ```
 
+When the input is a real MIDI file, the output writer preserves the original note timings and tempo.
+
+- without `--merge_tracks`, it keeps the original track layout and updates velocities in place
+- with `--merge_tracks`, it flattens the selected non-drum tracks into a single output track while keeping the original timing and tempo
+
 ## Condor
 
 There is a wrapper in [job_examples/train_velocity_job_example.sh](/Users/agus/repositories/transformational/job_examples/train_velocity_job_example.sh:1) and a minimal submit example in [job_examples/train_velocity_example.sub](/Users/agus/repositories/transformational/job_examples/train_velocity_example.sub:1).

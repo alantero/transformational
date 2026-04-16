@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_relative_attention_buckets", type=int, default=32)
     parser.add_argument("--relative_attention_max_distance", type=int, default=1024)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--ordinal_loss_weight", type=float, default=0.0,
+                        help="Weight for expected-value regression (ordinal) loss. "
+                             "CE treats bins as unordered categories; this term penalises "
+                             "predictions proportionally to their distance from the true bin. "
+                             "Recommended: 1.0-5.0. 0 = CE only (original behaviour).")
 
     parser.add_argument("--per_device_train_batch_size", type=int, default=16)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=32)
@@ -101,7 +106,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensorboard_dir", type=str, default=None, help="Optional TensorBoard log directory; defaults to <output_dir>/tensorboard")
     parser.add_argument("--tensorboard_flush_secs", type=int, default=30, help="Flush TensorBoard event files every N seconds")
 
-    parser.add_argument("--min_notes_per_sequence", type=int, default=1)
+    parser.add_argument("--min_notes_per_sequence", type=int, default=1,
+                        help="Skip sequences with fewer supervised note_on tokens than this")
+    parser.add_argument("--min_unique_velocity_bins", type=int, default=0,
+                        help="Skip sequences with fewer unique velocity bins than this. "
+                             "Filters out near-constant velocity sequences at training time. "
+                             "Recommended: 3. 0 = no filtering (original behaviour).")
     parser.add_argument("--default_velocity_bin", type=int, default=None)
     return parser.parse_args()
 
@@ -140,6 +150,10 @@ def log_event_to_tensorboard(writer: SummaryWriter, event: dict) -> None:
         writer.add_scalar("train/learning_rate", float(event["learning_rate"]), step)
         writer.add_scalar("train/elapsed_seconds", float(event["elapsed_seconds"]), step)
         writer.add_scalar("train/logged_updates", float(event.get("logged_updates", 1)), step)
+        if "train_batch_ce_loss" in event:
+            writer.add_scalar("train/ce_loss", float(event["train_batch_ce_loss"]), step)
+        if "train_batch_ordinal_loss" in event:
+            writer.add_scalar("train/ordinal_loss", float(event["train_batch_ordinal_loss"]), step)
     elif event_type == "eval":
         writer.add_scalar("eval/loss", float(event["eval_loss"]), step)
         writer.add_scalar("eval/accuracy", float(event["eval_accuracy"]), step)
@@ -168,6 +182,7 @@ def build_model_config(args: argparse.Namespace) -> VelocityTransformerConfig:
         num_relative_attention_buckets=args.num_relative_attention_buckets,
         relative_attention_max_distance=args.relative_attention_max_distance,
         label_smoothing=args.label_smoothing,
+        ordinal_loss_weight=args.ordinal_loss_weight,
     )
 
 
@@ -378,6 +393,7 @@ def main() -> None:
     train_dataset = ShardedMIDIVelocityDataset(
         str(train_dir),
         min_notes_per_sequence=args.min_notes_per_sequence,
+        min_unique_velocity_bins=args.min_unique_velocity_bins,
         default_velocity_bin=args.default_velocity_bin,
         use_manifest_cache=not args.disable_manifest_cache,
         manifest_path=train_manifest_path,
@@ -390,6 +406,7 @@ def main() -> None:
     val_dataset = ShardedMIDIVelocityDataset(
         str(val_dir),
         min_notes_per_sequence=args.min_notes_per_sequence,
+        min_unique_velocity_bins=args.min_unique_velocity_bins,
         default_velocity_bin=args.default_velocity_bin,
         use_manifest_cache=not args.disable_manifest_cache,
         manifest_path=val_manifest_path,
@@ -647,6 +664,10 @@ def main() -> None:
                     "learning_rate": scheduler.get_last_lr()[0],
                     "elapsed_seconds": elapsed,
                 }
+                if "ce_loss" in outputs:
+                    event["train_batch_ce_loss"] = outputs["ce_loss"].item()
+                if "ordinal_loss" in outputs:
+                    event["train_batch_ordinal_loss"] = outputs["ordinal_loss"].item()
                 append_metrics(event)
                 if train_bar is None:
                     print(
