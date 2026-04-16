@@ -17,8 +17,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 try:
     from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # pragma: no cover - optional dependency
+    _TENSORBOARD_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - optional dependency / broken env
     SummaryWriter = None
+    _TENSORBOARD_IMPORT_ERROR = exc
 
 try:
     from tqdm.auto import tqdm
@@ -369,7 +371,9 @@ def main() -> None:
     tensorboard_dir = Path(args.tensorboard_dir).expanduser().resolve() if args.tensorboard_dir else output_dir / "tensorboard"
     if args.tensorboard != "never":
         if SummaryWriter is None:
-            message = "TensorBoard logging requested but tensorboard is not installed"
+            message = "TensorBoard logging requested but TensorBoard is unavailable"
+            if _TENSORBOARD_IMPORT_ERROR is not None:
+                message = f"{message}: {_TENSORBOARD_IMPORT_ERROR}"
             if args.tensorboard == "always":
                 raise RuntimeError(f"{message}. Install it with `pip install tensorboard` or use --tensorboard never.")
             print(f"{message}; continuing without TensorBoard logs")

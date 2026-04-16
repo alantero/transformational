@@ -6,7 +6,7 @@ Encoder-only Transformer for predicting MIDI `set_velocity_*` tokens from the ex
 
 - **Bidirectional encoder** instead of GPT-style causal decoding.
 - **Predict on `note_on` positions** after stripping explicit velocity tokens from the input.
-- **Reuse the current `t5-midi` shards directly**: no dataset regeneration is required.
+- **Reuse the current `t5-midi` shards directly** when you already have good per-instrument data.
 - **Keep it local-friendly**: the default model is small enough to train and run on a single T4.
 
 The model uses:
@@ -32,6 +32,48 @@ dataset_root/
 
 Each shard must contain a 2-D padded tensor of token ids from the `t5-midi` vocabulary.
 
+## Recommended preprocessing for this task
+
+For a per-instrument velocity model, the most important dataset rule is:
+
+- do **not** mix unrelated instrument families unless you add explicit instrument conditioning
+
+If you train on a mixed corpus with no instrument token, the model is asked to learn a single
+"velocity style" for guitar, piano, bass, strings, etc. at once. That usually looks like train
+loss going down while validation stays poor.
+
+`preprocessing2.py` now has a recommended `segmented_tracks` mode that is much closer to the
+original `t5-midi` preprocessing flow:
+
+- it keeps only the instrument family you ask for
+- it creates multiple windows per MIDI instead of one random crop per song
+- it recursively splits windows that are too long
+- it logs real exception types into the `*_done.txt` files instead of opaque `FAIL`
+- it resolves CSV-relative paths relative to the CSV file itself
+
+Example for a guitar-only dataset:
+
+```bash
+python preprocessing2.py /path/to/files.csv /path/to/output 1024 \
+  --strategy segmented_tracks \
+  --instrument-family guitar \
+  --min-unique-bins 3 \
+  --min-notes 8 \
+  --min-seg-duration 5 \
+  --max-seg-duration 120 \
+  --stride 100 \
+  --workers 8
+```
+
+If a run is unexpectedly writing only `FAIL` entries, first rerun in serial mode so the true
+exception is visible immediately:
+
+```bash
+python preprocessing2.py /path/to/files.csv /path/to/output 1024 --workers 0
+```
+
+That is the safest way to catch bad paths, malformed MIDI files, or environment issues on EOS.
+
 ## Training locally
 
 Recommended starting point:
@@ -49,10 +91,15 @@ python train_velocity.py \
   --per_device_eval_batch_size 32 \
   --learning_rate 3e-4 \
   --num_train_epochs 10 \
+  --min_unique_velocity_bins 3 \
+  --ordinal_loss_weight 1.0 \
   --precision auto \
   --eval_every_steps 500 \
   --save_every_steps 500
 ```
+
+If validation is dramatically worse than training, check the dataset before changing the model size.
+For this task, bad preprocessing is a much more likely culprit than the encoder architecture.
 
 TensorBoard is now written automatically when the `tensorboard` package is installed. Event files go to `results/velocity-base/tensorboard` by default.
 

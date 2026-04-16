@@ -2,24 +2,25 @@
 """
 preprocessing2.py – Velocity-aware MIDI preprocessing
 ------------------------------------------------------
-One sequence per song: picks the most expressive non-drum track (highest
-velocity diversity), tokenises it, and extracts a single window of
-max_tokens.  With ~200k songs this gives ~200k training sequences with
-maximum variety across songs instead of many windows from few songs.
 
-Restart-safe: maintains a checkpoint log so interrupted runs resume
-where they left off.  Shard numbering picks up after the highest
-existing shard file.
+Two dataset-building strategies are available:
 
-Future passes: run with --pass N to extract different random windows
-from the same files (different seed per pass).  The log is per-pass
-so passes are independent.
+1. ``segmented_tracks`` (default)
+   Build many per-instrument windows per MIDI, recursively splitting long
+   spans until they fit under ``max_tokens``. This is the recommended mode
+   for velocity modelling because it is closer to the original ``t5-midi``
+   preprocessing flow and gives much better data coverage.
 
-Usage
------
-    python preprocessing2.py songs.csv /output/dir 1024
-    python preprocessing2.py songs.csv /output/dir 1024 --augment
-    python preprocessing2.py songs.csv /output/dir 1024 --pass 1
+2. ``best_track_window``
+   Legacy mode: pick the most expressive non-drum track and extract a single
+   random window per song.
+
+Restart-safe: maintains a checkpoint log so interrupted runs resume where they
+left off. Shard numbering picks up after the highest existing shard file.
+
+Future passes: run with ``--pass N`` to extract different windows from the
+same files (different seed per pass). The log is per-pass so passes are
+independent.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import random
 import re
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from pathlib import Path
 from random import seed as random_seed
 from random import shuffle
 
@@ -57,6 +59,21 @@ from velocity_transformer.vocab import (
     velocity_events,
     velocity_start,
 )
+
+GM_PROGRAM_GROUPS: dict[str, tuple[int, ...]] = {
+    "piano": tuple(range(0, 8)),
+    "chromatic": tuple(range(8, 16)),
+    "organ": tuple(range(16, 24)),
+    "guitar": tuple(range(24, 32)),
+    "bass": tuple(range(32, 40)),
+    "strings": tuple(range(40, 48)),
+    "ensemble": tuple(range(48, 56)),
+    "brass": tuple(range(56, 64)),
+    "reed": tuple(range(64, 72)),
+    "pipe": tuple(range(72, 80)),
+    "synth_lead": tuple(range(80, 88)),
+    "synth_pad": tuple(range(88, 96)),
+}
 
 # --------------------------------------------------------------------------- #
 # checkpoint log helpers (unchanged)
@@ -112,18 +129,51 @@ def score_track(instrument: pretty_midi.Instrument) -> tuple[int, float, int]:
 
 def select_best_track(
     pm: pretty_midi.PrettyMIDI,
+    *,
+    allowed_programs: set[int] | None = None,
 ) -> tuple[pretty_midi.Instrument | None, int]:
     """Return (best_instrument, instrument_index) or (None, -1)."""
     best: pretty_midi.Instrument | None = None
     best_idx = -1
     best_score = (-1, 0.0, 0)
     for idx, inst in enumerate(pm.instruments):
+        if allowed_programs is not None and inst.program not in allowed_programs:
+            continue
         sc = score_track(inst)
         if sc > best_score:
             best_score = sc
             best = inst
             best_idx = idx
     return best, best_idx
+
+
+def select_eligible_tracks(
+    pm: pretty_midi.PrettyMIDI,
+    *,
+    allowed_programs: set[int] | None = None,
+) -> list[pretty_midi.Instrument]:
+    eligible: list[pretty_midi.Instrument] = []
+    for inst in pm.instruments:
+        if inst.is_drum or not inst.notes:
+            continue
+        if allowed_programs is not None and inst.program not in allowed_programs:
+            continue
+        eligible.append(inst)
+    return eligible
+
+
+def resolve_allowed_programs(
+    *,
+    programs: list[int] | None,
+    instrument_family: str | None,
+) -> set[int] | None:
+    if not programs and not instrument_family:
+        return None
+
+    resolved: set[int] = set(programs or [])
+    if instrument_family:
+        resolved.update(GM_PROGRAM_GROUPS[instrument_family])
+    return resolved
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +224,26 @@ def tokenize_instrument(instrument: pretty_midi.Instrument) -> list[int]:
     return tokens
 
 
+def _valid_window_start_offsets(raw_tokens: list[int], content_max: int) -> list[int]:
+    """Return offsets that do not start in the middle of a velocity->note_on pair."""
+    if len(raw_tokens) <= content_max:
+        return [0]
+    max_offset = len(raw_tokens) - content_max
+    offsets = [0]
+    for idx in range(1, max_offset + 1):
+        token = raw_tokens[idx]
+        prev = raw_tokens[idx - 1]
+        # Prefer starting at a fresh velocity token or immediately after a note_off/time-shift/start-like boundary.
+        if velocity_start <= token < velocity_start + velocity_events:
+            offsets.append(idx)
+        elif (
+            note_on_start <= token < note_on_start + note_on_events
+            and velocity_start <= prev < velocity_start + velocity_events
+        ):
+            offsets.append(idx - 1)
+    return sorted(set(offsets))
+
+
 # --------------------------------------------------------------------------- #
 # optional data augmentation (pitch shift + time stretch)
 # --------------------------------------------------------------------------- #
@@ -221,6 +291,161 @@ def augment_track(
     return out
 
 
+def slice_instrument_window(
+    instrument: pretty_midi.Instrument,
+    start: float,
+    stop: float,
+) -> pretty_midi.Instrument:
+    """Copy notes overlapping ``[start, stop]`` and rebase them to 0."""
+    out = pretty_midi.Instrument(
+        program=instrument.program,
+        is_drum=instrument.is_drum,
+        name=instrument.name,
+    )
+    for note in instrument.notes:
+        if note.start < stop and note.end > start:
+            out.notes.append(
+                pretty_midi.Note(
+                    velocity=note.velocity,
+                    pitch=note.pitch,
+                    start=max(0.0, note.start - start),
+                    end=min(stop - start, note.end - start),
+                )
+            )
+    return out
+
+
+def build_wrapped_sequence(
+    instrument: pretty_midi.Instrument,
+    *,
+    max_tokens: int,
+) -> list[int]:
+    raw_tokens = tokenize_instrument(instrument)
+    if len(raw_tokens) + 2 > max_tokens:
+        raise ValueError("instrument window does not fit into max_tokens")
+    return [start_token] + raw_tokens + [end_token]
+
+
+def process_segment_window(
+    instrument: pretty_midi.Instrument,
+    *,
+    start: float,
+    stop: float,
+    max_tokens: int,
+    min_unique_bins: int,
+    min_notes: int,
+    min_seg_duration: float,
+    augment: bool,
+    pitch_min: int,
+    pitch_max: int,
+    stretch_min: float,
+    stretch_max: float,
+) -> list[list[int]]:
+    if stop - start < min_seg_duration:
+        return []
+
+    segment = slice_instrument_window(instrument, start, stop)
+    if not segment.notes:
+        return []
+
+    if min_unique_bins > 0 and score_track(segment)[0] < min_unique_bins:
+        return []
+    if len(segment.notes) < min_notes:
+        return []
+
+    token_source = segment
+    if augment:
+        token_source = augment_track(
+            segment,
+            pitch_min=pitch_min,
+            pitch_max=pitch_max,
+            stretch_min=stretch_min,
+            stretch_max=stretch_max,
+        )
+
+    try:
+        sequence = build_wrapped_sequence(token_source, max_tokens=max_tokens)
+    except ValueError:
+        mid = start + (stop - start) / 2.0
+        if mid <= start or mid >= stop:
+            return []
+        return process_segment_window(
+            instrument,
+            start=start,
+            stop=mid,
+            max_tokens=max_tokens,
+            min_unique_bins=min_unique_bins,
+            min_notes=min_notes,
+            min_seg_duration=min_seg_duration,
+            augment=augment,
+            pitch_min=pitch_min,
+            pitch_max=pitch_max,
+            stretch_min=stretch_min,
+            stretch_max=stretch_max,
+        ) + process_segment_window(
+            instrument,
+            start=mid,
+            stop=stop,
+            max_tokens=max_tokens,
+            min_unique_bins=min_unique_bins,
+            min_notes=min_notes,
+            min_seg_duration=min_seg_duration,
+            augment=augment,
+            pitch_min=pitch_min,
+            pitch_max=pitch_max,
+            stretch_min=stretch_min,
+            stretch_max=stretch_max,
+        )
+
+    return [sequence]
+
+
+def process_track_segments(
+    instrument: pretty_midi.Instrument,
+    *,
+    max_tokens: int,
+    min_unique_bins: int,
+    min_notes: int,
+    min_seg_duration: float,
+    max_seg_duration: float,
+    stride: float,
+    augment: bool,
+    pitch_min: int,
+    pitch_max: int,
+    stretch_min: float,
+    stretch_max: float,
+) -> list[list[int]]:
+    if not instrument.notes:
+        return []
+
+    end_time = max(note.end for note in instrument.notes)
+    if end_time <= 0:
+        return []
+
+    sequences: list[list[int]] = []
+    start = 0.0
+    while start < end_time:
+        stop = min(start + max_seg_duration, end_time)
+        sequences.extend(
+            process_segment_window(
+                instrument,
+                start=start,
+                stop=stop,
+                max_tokens=max_tokens,
+                min_unique_bins=min_unique_bins,
+                min_notes=min_notes,
+                min_seg_duration=min_seg_duration,
+                augment=augment,
+                pitch_min=pitch_min,
+                pitch_max=pitch_max,
+                stretch_min=stretch_min,
+                stretch_max=stretch_max,
+            )
+        )
+        start += stride
+    return sequences
+
+
 # --------------------------------------------------------------------------- #
 # MIDI → one sequence
 # --------------------------------------------------------------------------- #
@@ -228,31 +453,49 @@ def augment_track(
 def process_midi_file(
     path: str,
     *,
+    strategy: str = "segmented_tracks",
     max_tokens: int = 1024,
     min_unique_bins: int = 3,
     min_notes: int = 8,
+    allowed_programs: set[int] | None = None,
     augment: bool = False,
     pitch_min: int = 36,
     pitch_max: int = 96,
     stretch_min: float = 0.9,
     stretch_max: float = 1.1,
+    min_seg_duration: float = 5.0,
+    max_seg_duration: float = 120.0,
+    stride: float = 100.0,
 ) -> list[list[int]]:
-    """Process one MIDI file → at most one token sequence.
-
-    1. Select the non-drum track with the highest velocity diversity.
-    2. Optionally augment (pitch shift + time stretch).
-    3. Tokenise into the Oore et al. vocabulary.
-    4. Take a single random window of *max_tokens* (or the full sequence if shorter).
-    5. Wrap with <start> / <end>.
-
-    Returns a list with zero or one sequence (list keeps the executor interface).
-    """
+    """Process one MIDI file into one or more token sequences."""
     try:
         pm = pretty_midi.PrettyMIDI(path)
     except Exception:
         raise
 
-    best_track, _track_idx = select_best_track(pm)
+    if strategy == "segmented_tracks":
+        tracks = select_eligible_tracks(pm, allowed_programs=allowed_programs)
+        sequences: list[list[int]] = []
+        for track in tracks:
+            sequences.extend(
+                process_track_segments(
+                    track,
+                    max_tokens=max_tokens,
+                    min_unique_bins=min_unique_bins,
+                    min_notes=min_notes,
+                    min_seg_duration=min_seg_duration,
+                    max_seg_duration=max_seg_duration,
+                    stride=stride,
+                    augment=augment,
+                    pitch_min=pitch_min,
+                    pitch_max=pitch_max,
+                    stretch_min=stretch_min,
+                    stretch_max=stretch_max,
+                )
+            )
+        return sequences
+
+    best_track, _track_idx = select_best_track(pm, allowed_programs=allowed_programs)
     if best_track is None:
         return []
 
@@ -280,7 +523,8 @@ def process_midi_file(
     if len(raw_tokens) <= content_max:
         seq = [start_token] + raw_tokens + [end_token]
     else:
-        offset = random.randint(0, len(raw_tokens) - content_max)
+        candidate_offsets = _valid_window_start_offsets(raw_tokens, content_max)
+        offset = random.choice(candidate_offsets)
         seq = [start_token] + raw_tokens[offset : offset + content_max] + [end_token]
 
     # Check minimum note_on count in the final window
@@ -374,6 +618,20 @@ def sequence_generator(
     if skipped:
         print(f"  [{desc}] skipping {skipped} already-processed files")
 
+    if workers <= 0:
+        with tqdm(total=len(todo), desc=desc) as bar:
+            for path in todo:
+                try:
+                    seqs = _process_file(path, **pf_kw)
+                except Exception as exc:
+                    append_log(log_path, path, f"FAIL:{type(exc).__name__}:{exc}")
+                    bar.update(1)
+                    continue
+                for seq in seqs:
+                    yield path, seq
+                bar.update(1)
+        return
+
     with ProcessPoolExecutor(max_workers=workers) as ex, tqdm(
         total=len(todo), desc=desc
     ) as bar:
@@ -395,9 +653,10 @@ def sequence_generator(
                 try:
                     seqs = fut.result()
                     flag = "OK-buffer"
-                except Exception:
-                    seqs, flag = [], "FAIL"
+                except Exception as exc:
+                    seqs, flag = [], f"FAIL:{type(exc).__name__}:{exc}"
                     append_log(log_path, path, flag)
+                    print(f"[{desc}] FAIL {path}: {type(exc).__name__}: {exc}")
 
                 if flag == "OK-buffer":
                     for s in seqs:
@@ -421,13 +680,17 @@ def sequence_generator(
 def main():
     pa = argparse.ArgumentParser(
         description="Preprocess MIDI files into velocity-prediction training shards. "
-        "One sequence per song from the most expressive track.",
+        "Default mode builds segmented per-instrument windows.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     pa.add_argument("source", help="CSV with a 'filepath' column pointing to MIDI files")
     pa.add_argument("dest", help="Output base directory (train/ and val/ created inside)")
     pa.add_argument("length", type=int, help="Max sequence length in tokens (e.g. 1024)")
 
+    pa.add_argument("--strategy", choices=["segmented_tracks", "best_track_window"],
+                    default="segmented_tracks",
+                    help="segmented_tracks is recommended for per-instrument velocity modelling; "
+                         "best_track_window keeps the old one-window-per-song behaviour")
     pa.add_argument("--min-unique-bins", type=int, default=3,
                     help="Skip tracks with fewer unique velocity bins")
     pa.add_argument("--min-notes", type=int, default=8,
@@ -437,10 +700,22 @@ def main():
     pa.add_argument("--shard-size", type=int, default=100_000,
                     help="Max sequences per shard file")
     pa.add_argument("--workers", type=int, default=8,
-                    help="Parallel MIDI processing workers")
+                    help="Parallel MIDI processing workers. Use 0 for serial debug mode.")
+    pa.add_argument("--instrument-family", choices=sorted(GM_PROGRAM_GROUPS.keys()), default=None,
+                    help="Convenience filter for common GM program families. "
+                         "Use this or --programs to keep the dataset truly per-instrument.")
+    pa.add_argument("--programs", nargs="*", type=int, default=None,
+                    help="Optional MIDI program numbers to keep. "
+                         "If set, only tracks with one of these programs are eligible.")
     pa.add_argument("--pass", type=int, default=0, dest="pass_num",
                     help="Pass number: each pass uses a different random seed "
                          "to extract different windows. Log files are per-pass.")
+    pa.add_argument("--min-seg-duration", type=float, default=5.0,
+                    help="Minimum segment duration in seconds for segmented_tracks mode")
+    pa.add_argument("--max-seg-duration", type=float, default=120.0,
+                    help="Maximum segment duration in seconds before recursive splitting")
+    pa.add_argument("--stride", type=float, default=100.0,
+                    help="Sliding-window stride in seconds for segmented_tracks mode")
 
     aug = pa.add_argument_group("data augmentation (disabled by default)")
     aug.add_argument("--augment", action="store_true",
@@ -458,8 +733,34 @@ def main():
     torch.manual_seed(seed)
 
     # Read MIDI paths from CSV
-    with open(args.source, newline="", encoding="utf-8") as f:
-        midi_paths = [r["filepath"] for r in csv.DictReader(f)]
+    source_csv = Path(args.source).expanduser().resolve()
+    with open(source_csv, newline="", encoding="utf-8") as f:
+        midi_paths = []
+        reader = csv.DictReader(f)
+        if "filepath" not in (reader.fieldnames or []):
+            raise ValueError(
+                f"{source_csv} must contain a 'filepath' column. "
+                f"Columns found: {reader.fieldnames}"
+            )
+        for row in reader:
+            raw_path = row["filepath"]
+            midi_path = Path(raw_path).expanduser()
+            if not midi_path.is_absolute():
+                csv_relative = (source_csv.parent / midi_path).resolve()
+                cwd_relative = midi_path.resolve()
+                midi_path = csv_relative if csv_relative.exists() or not cwd_relative.exists() else cwd_relative
+            midi_paths.append(str(midi_path))
+
+    existing_paths = [path for path in midi_paths if os.path.exists(path)]
+    missing_paths = [path for path in midi_paths if not os.path.exists(path)]
+    print(
+        f"CSV path audit: total={len(midi_paths)} existing={len(existing_paths)} "
+        f"missing={len(missing_paths)}"
+    )
+    if missing_paths:
+        print("First missing paths:")
+        for missing in missing_paths[:5]:
+            print(f"  {missing}")
 
     shuffle(midi_paths)
     split = int(len(midi_paths) * args.train_fraction)
@@ -467,15 +768,35 @@ def main():
     print(f"Source CSV: {len(midi_paths)} files → {len(train_files)} train, {len(val_files)} val")
     print(f"Pass {args.pass_num} (seed={seed}), augment={'ON' if args.augment else 'OFF'}")
 
+    allowed_programs = resolve_allowed_programs(
+        programs=args.programs,
+        instrument_family=args.instrument_family,
+    )
+    if allowed_programs is None:
+        print(
+            "WARNING: no program filter is active. This will mix instrument families, "
+            "which is usually a bad fit for a per-instrument velocity model."
+        )
+    else:
+        print(
+            f"Program filter active: {len(allowed_programs)} program(s) -> "
+            f"{sorted(allowed_programs)}"
+        )
+
     pf_kw = dict(
+        strategy=args.strategy,
         max_tokens=args.length,
         min_unique_bins=args.min_unique_bins,
         min_notes=args.min_notes,
+        allowed_programs=allowed_programs,
         augment=args.augment,
         pitch_min=args.pitch_range[0],
         pitch_max=args.pitch_range[1],
         stretch_min=args.stretch_range[0],
         stretch_max=args.stretch_range[1],
+        min_seg_duration=args.min_seg_duration,
+        max_seg_duration=args.max_seg_duration,
+        stride=args.stride,
     )
 
     base = args.dest.rstrip("/")
